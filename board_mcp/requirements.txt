@@ -1,0 +1,4 @@
+mcp[cli]==1.27.0
+paramiko==4.0.0
+pyserial==3.5
+cryptography==44.0.1
