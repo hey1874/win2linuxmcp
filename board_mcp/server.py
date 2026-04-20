@@ -8,6 +8,7 @@ import io
 import json
 import os
 import select
+import shlex
 import socket
 import stat
 import sys
@@ -214,7 +215,7 @@ def run(session_id: str, command: str, timeout: int = 60, workdir: str = None) -
         dict with stdout, stderr, exit_code
     """
     s = _get_session(session_id)
-    full_cmd = f"cd {workdir} && {command}" if workdir else command
+    full_cmd = f"cd {shlex.quote(workdir)} && {command}" if workdir else command
     stdout, stderr, exit_code = _run(s, full_cmd, timeout=timeout)
     _log_event(s, "run", {"command": command, "exit_code": exit_code})
     return {
@@ -249,7 +250,7 @@ def run_background(
     job_id = str(uuid.uuid4())[:6]
     log_path = f"{log_dir}/board_mcp_{job_id}.log"
 
-    cd = f"cd {workdir} && " if workdir else ""
+    cd = f"cd {shlex.quote(workdir)} && " if workdir else ""
     # Run detached, save stdout+stderr to log, also capture PID
     wrapper = (
         f"({cd}{command}) > {log_path} 2>&1 & "
@@ -407,18 +408,18 @@ def journalctl(
 
 
 @mcp.tool()
-def list_processes(session_id: str, filter: str = None) -> str:
+def list_processes(session_id: str, keyword: str = None) -> str:
     """
     List running processes on the board.
 
     Args:
         session_id: Session ID
-        filter: Optional grep filter string
+        keyword: Optional filter string (case-insensitive)
     """
     s = _get_session(session_id)
     cmd = "ps aux --sort=-%cpu | head -40"
-    if filter:
-        cmd = f"ps aux | grep -i '{filter}' | grep -v grep"
+    if keyword:
+        cmd = f"ps aux | grep -i {shlex.quote(keyword)} | grep -v grep"
     stdout, _, _ = _run(s, cmd)
     return stdout
 
@@ -647,42 +648,48 @@ def port_forward(
     """
     s = _get_session(session_id)
     local_port = local_port or remote_port
-    transport = s.client.get_transport()
-    transport.request_port_forward("", local_port)
 
-    def _forward_worker():
+    server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    server_sock.bind(("127.0.0.1", local_port))
+    server_sock.listen(5)
+
+    def _tunnel(local_sock, chan):
+        try:
+            while True:
+                r, _, _ = select.select([local_sock, chan], [], [], 1)
+                if local_sock in r:
+                    data = local_sock.recv(4096)
+                    if not data:
+                        break
+                    chan.sendall(data)
+                if chan in r:
+                    data = chan.recv(4096)
+                    if not data:
+                        break
+                    local_sock.sendall(data)
+        finally:
+            chan.close()
+            local_sock.close()
+
+    def _accept_worker():
         while True:
             try:
-                chan = transport.accept(1)
-                if chan is None:
+                r, _, _ = select.select([server_sock], [], [], 1)
+                if not r:
                     continue
-                # Connect to remote side
-                sock = socket.create_connection((remote_host, remote_port))
-                thr = threading.Thread(
-                    target=_tunnel, args=(chan, sock), daemon=True
+                client_sock, _ = server_sock.accept()
+                transport = s.client.get_transport()
+                chan = transport.open_channel(
+                    "direct-tcpip",
+                    (remote_host, remote_port),
+                    ("127.0.0.1", 0),
                 )
-                thr.start()
+                threading.Thread(target=_tunnel, args=(client_sock, chan), daemon=True).start()
             except Exception:
                 break
 
-    def _tunnel(chan, sock):
-        while True:
-            r, _, _ = select.select([chan, sock], [], [], 1)
-            if chan in r:
-                data = chan.recv(1024)
-                if not data:
-                    break
-                sock.send(data)
-            if sock in r:
-                data = sock.recv(1024)
-                if not data:
-                    break
-                chan.send(data)
-        chan.close()
-        sock.close()
-
-    t = threading.Thread(target=_forward_worker, daemon=True)
-    t.start()
+    threading.Thread(target=_accept_worker, daemon=True).start()
 
     return {
         "status": "forwarding",
